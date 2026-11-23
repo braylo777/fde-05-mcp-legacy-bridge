@@ -56,8 +56,8 @@ impl<'a> P<'a> {
         &self.s[self.i..]
     }
     fn skip_ws(&mut self) {
-        while self.rest().starts_with(|c: char| c.is_whitespace()) {
-            self.i += 1;
+        while let Some(c) = self.rest().chars().next().filter(|c| c.is_whitespace()) {
+            self.i += c.len_utf8(); // multibyte whitespace must not split a char
         }
     }
     fn skip_misc(&mut self) -> Result<(), String> {
@@ -101,7 +101,7 @@ impl<'a> P<'a> {
             return Ok(node);
         }
         loop {
-            if self.rest().starts_with(&format!("</{qname}")) {
+            if self.rest().starts_with(&format!("</{qname}")) && self.rest()[qname.len() + 2..].starts_with(|c: char| c == '>' || c.is_whitespace()) {
                 self.i += self.rest().find('>').ok_or("unterminated close tag")? + 1;
                 node.text = node.text.trim().to_string();
                 return Ok(node);
@@ -187,6 +187,12 @@ mod tests {
         assert!(parse("<a><b></a>").is_err());
         assert!(parse("<a>").is_err());
         assert!(parse("<a/><b/>").is_err());
+    }
+    #[test]
+    fn multibyte_whitespace_and_prefix_close_tags() {
+        assert!(parse("\u{3000}<a>x</a>").is_ok());
+        assert!(parse("<a>é</a>\u{2003}").is_ok());
+        assert!(parse("<a>x</ab>").is_err());
     }
     #[test]
     fn repeated_children_become_arrays() {
