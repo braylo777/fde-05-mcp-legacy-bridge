@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "A raw JSON-RPC MCP server that lets agents call legacy SOAP and SAP systems safely, with rate limits."
-repository = "https://github.com/braylo-ai/fde-05-mcp-legacy-bridge"
+repository = "https://github.com/braylo777/fde-05-mcp-legacy-bridge"
 
 [lib]
 crate-type = ["rlib", "cdylib"]
