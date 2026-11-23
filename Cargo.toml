@@ -1,0 +1,26 @@
+[package]
+name = "fde-05-mcp-legacy-bridge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "A raw JSON-RPC MCP server that lets agents call legacy SOAP and SAP systems safely, with rate limits."
+repository = "https://github.com/braylo-ai/fde-05-mcp-legacy-bridge"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[[bin]]
+name = "fde-05-mcp-legacy-bridge"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.154"
+sha2 = "=0.10.9"
+hmac = "=0.12.1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+panic = "abort"
+codegen-units = 1
