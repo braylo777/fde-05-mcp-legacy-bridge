@@ -4,6 +4,8 @@
 
 A Model Context Protocol server written on raw JSON-RPC 2.0 that lets an agent call a 2004-era SOAP system and SAP, with schema checks, safe XML, and rate limits the old system can survive.
 
+**Also built as Project 5 of 12, "Raw MCP-to-ERP Bridge",** from the companion [12 FDE projects post](https://x.com/suraj_sharma14/status/2125197762752806998).
+
 **Live demo:** https://fde-05-mcp-legacy-bridge.braylo777.workers.dev — the Rust core runs in your browser as WebAssembly. No server, no tracking.
 
 ## Why this matters
@@ -13,6 +15,7 @@ Agents need tools, and in a large company the tools are SOAP services, SAP OData
 ## What it does
 
 - MCP on raw JSON-RPC 2.0: initialize, ping, tools/list, tools/call, notifications, batches, error codes -32700 / -32600 / -32601 / -32602 / -32002
+- Safe writes: legacy_update_customer is two-step (preview diff, then commit with a one-use, 60-second confirm token), needs an idempotency key, uses optimistic locking on the record version, and routes big credit-limit jumps to a human
 - stdio transport: fde-05-mcp-legacy-bridge serve works with any MCP client
 - Input-schema validation before any legacy call (required, types, pattern, no extra args)
 - SOAP 1.1: envelope builder with escaped values and validated element names; strict XML reader that refuses DOCTYPE (no XXE); Fault handling
@@ -21,7 +24,7 @@ Agents need tools, and in a large company the tools are SOAP services, SAP OData
 
 ## What it does not do (yet)
 
-- The SOAP backend is an in-process mock; production needs an HTTP client and the real WSDL
+- The SOAP backend is an in-process mock (stateful, so writes are real in the demo); production needs an HTTP client and the real WSDL
 - No headless-browser fallback for systems with no API
 - No real SAP RFC / BAPI or Oracle EBS connector; OData URL building only
 - No Streamable HTTP transport or OAuth for the MCP server (stdio only)
@@ -99,7 +102,7 @@ web/              demo page; examples.json drives both the page and this README
 
 ## Part of a series
 
-This is one of 12 repos that work through a public Forward Deployed Engineering roadmap ([source post](https://x.com/suraj_sharma14/status/2124827808535048566)). All 12: [github.com/braylo777?q=fde-](https://github.com/braylo777?tab=repositories&q=fde-).
+This is one of 12 repos that work through a public Forward Deployed Engineering roadmap ([12 stages](https://x.com/suraj_sharma14/status/2124827808535048566), [12 projects](https://x.com/suraj_sharma14/status/2125197762752806998)). All 12: [github.com/braylo777?q=fde-](https://github.com/braylo777?tab=repositories&q=fde-).
 
 ## License
 

@@ -6,6 +6,7 @@
   "why": "Agents need tools, and in a large company the tools are SOAP services, SAP OData endpoints and systems that fall over at ten requests a second. An SDK hides the protocol; an FDE has to debug it at the wire. This repo implements MCP directly on JSON-RPC, validates every argument before it reaches the legacy system, translates JSON to SOAP and back without injection holes, and throttles calls so the agent cannot take the mainframe down.",
   "covers": [
     "MCP on raw JSON-RPC 2.0: initialize, ping, tools/list, tools/call, notifications, batches, error codes -32700 / -32600 / -32601 / -32602 / -32002",
+    "Safe writes: legacy_update_customer is two-step (preview diff, then commit with a one-use, 60-second confirm token), needs an idempotency key, uses optimistic locking on the record version, and routes big credit-limit jumps to a human",
     "stdio transport: fde-05-mcp-legacy-bridge serve works with any MCP client",
     "Input-schema validation before any legacy call (required, types, pattern, no extra args)",
     "SOAP 1.1: envelope builder with escaped values and validated element names; strict XML reader that refuses DOCTYPE (no XXE); Fault handling",
@@ -13,7 +14,7 @@
     "SAP OData v2 URL builder: typed filters, quote escaping, $top cap, column checks"
   ],
   "gaps": [
-    "The SOAP backend is an in-process mock; production needs an HTTP client and the real WSDL",
+    "The SOAP backend is an in-process mock (stateful, so writes are real in the demo); production needs an HTTP client and the real WSDL",
     "No headless-browser fallback for systems with no API",
     "No real SAP RFC / BAPI or Oracle EBS connector; OData URL building only",
     "No Streamable HTTP transport or OAuth for the MCP server (stdio only)"
@@ -227,6 +228,132 @@
       }
     },
     {
+      "op": "mcp",
+      "label": "Safe ERP write",
+      "help": "Agent reads a customer, previews a credit-limit change, commits it with the one-use confirm token and an idempotency key. A retried commit is replayed, not re-written. A stale version and an over-limit jump are refused.",
+      "input": {
+        "messages": [
+          {
+            "at_ms": 0,
+            "msg": {
+              "jsonrpc": "2.0",
+              "id": 1,
+              "method": "initialize",
+              "params": {}
+            }
+          },
+          {
+            "at_ms": 100,
+            "msg": {
+              "jsonrpc": "2.0",
+              "id": 2,
+              "method": "tools/call",
+              "params": {
+                "name": "legacy_get_customer",
+                "arguments": {
+                  "customer_id": "C-1001"
+                }
+              }
+            }
+          },
+          {
+            "at_ms": 200,
+            "msg": {
+              "jsonrpc": "2.0",
+              "id": 3,
+              "method": "tools/call",
+              "params": {
+                "name": "legacy_update_customer",
+                "arguments": {
+                  "customer_id": "C-1001",
+                  "field": "CreditLimit",
+                  "value": "25000.00",
+                  "expected_version": 7,
+                  "mode": "preview"
+                }
+              }
+            }
+          },
+          {
+            "at_ms": 1500,
+            "msg": {
+              "jsonrpc": "2.0",
+              "id": 4,
+              "method": "tools/call",
+              "params": {
+                "name": "legacy_update_customer",
+                "arguments": {
+                  "customer_id": "C-1001",
+                  "field": "CreditLimit",
+                  "value": "25000.00",
+                  "expected_version": 7,
+                  "mode": "commit",
+                  "confirm_token": "c5cdf3c2a34c9882",
+                  "idempotency_key": "po-credit-0917"
+                }
+              }
+            }
+          },
+          {
+            "at_ms": 3000,
+            "msg": {
+              "jsonrpc": "2.0",
+              "id": 5,
+              "method": "tools/call",
+              "params": {
+                "name": "legacy_update_customer",
+                "arguments": {
+                  "customer_id": "C-1001",
+                  "field": "CreditLimit",
+                  "value": "25000.00",
+                  "expected_version": 7,
+                  "mode": "commit",
+                  "confirm_token": "c5cdf3c2a34c9882",
+                  "idempotency_key": "po-credit-0917"
+                }
+              }
+            }
+          },
+          {
+            "at_ms": 4500,
+            "msg": {
+              "jsonrpc": "2.0",
+              "id": 6,
+              "method": "tools/call",
+              "params": {
+                "name": "legacy_update_customer",
+                "arguments": {
+                  "customer_id": "C-1001",
+                  "field": "CreditLimit",
+                  "value": "26000.00",
+                  "expected_version": 7,
+                  "mode": "preview"
+                }
+              }
+            }
+          },
+          {
+            "at_ms": 6000,
+            "msg": {
+              "jsonrpc": "2.0",
+              "id": 7,
+              "method": "tools/call",
+              "params": {
+                "name": "legacy_update_customer",
+                "arguments": {
+                  "customer_id": "C-1001",
+                  "field": "CreditLimit",
+                  "value": "90000.00",
+                  "expected_version": 8,
+                  "mode": "preview"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
       "op": "json_to_soap",
       "label": "JSON to SOAP",
       "help": "Values are XML-escaped, so a < or & in data cannot break the envelope. Try a key like a><b: it is refused.",
@@ -301,5 +428,9 @@
         "top": 5000
       }
     }
-  ]
+  ],
+  "project": {
+    "n": 5,
+    "title": "Raw MCP-to-ERP Bridge"
+  }
 }

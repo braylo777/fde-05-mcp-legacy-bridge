@@ -13,7 +13,18 @@ pub struct Server {
     buckets: HashMap<String, Bucket>,
     pub clock_ms: u64,
     pub audit: Vec<Value>,
+    pub backend: legacy::Backend,
+    /// confirm_token -> (args that were previewed, expiry ms). One use each.
+    pending: HashMap<String, (Value, u64)>,
+    /// idempotency_key -> committed result, so a retried commit never writes twice.
+    committed: HashMap<String, (Value, Value)>,
 }
+
+/// How long a preview's confirm token stays valid.
+pub const CONFIRM_TTL_MS: u64 = 60_000;
+/// Credit-limit changes above either bound are refused and routed to a human.
+pub const MAX_LIMIT_STEP_CENTS: i64 = 1_000_000;
+pub const MAX_LIMIT_STEP_PCT: i64 = 50;
 
 impl Default for Server {
     fn default() -> Self {
@@ -22,6 +33,9 @@ impl Default for Server {
             buckets: HashMap::new(),
             clock_ms: 0,
             audit: vec![],
+            backend: legacy::Backend::default(),
+            pending: HashMap::new(),
+            committed: HashMap::new(),
         }
     }
 }
@@ -41,7 +55,20 @@ fn tools() -> Value {
              "entity_set": {"type": "string"}, "top": {"type": "integer"},
              "select": {"type": "array"}, "filters": {"type": "array"}},
              "required": ["entity_set"], "additionalProperties": false},
-         "annotations": {"readOnlyHint": true}}
+         "annotations": {"readOnlyHint": true}},
+        {"name": "legacy_update_customer",
+         "description": "Change one field (Status or CreditLimit) on a CRM customer. Two steps: mode=preview returns the diff and a one-use confirm_token; mode=commit with that token and an idempotency_key writes it. Stale expected_version is refused.",
+         "inputSchema": {"type": "object", "properties": {
+             "customer_id": {"type": "string", "pattern": "^C-[0-9]{4}$"},
+             "field": {"type": "string", "enum": ["Status", "CreditLimit"]},
+             "value": {"type": "string"},
+             "expected_version": {"type": "integer"},
+             "mode": {"type": "string", "enum": ["preview", "commit"]},
+             "confirm_token": {"type": "string"},
+             "idempotency_key": {"type": "string"}},
+             "required": ["customer_id", "field", "value", "expected_version", "mode"],
+             "additionalProperties": false},
+         "annotations": {"readOnlyHint": false, "destructiveHint": false, "idempotentHint": true}}
     ])
 }
 
@@ -72,6 +99,11 @@ pub fn validate(schema: &Value, args: &Value) -> Result<(), String> {
         if !ok {
             return Err(format!("argument `{k}` must be {}", p["type"]));
         }
+        if let Some(allowed) = p["enum"].as_array() {
+            if !allowed.contains(v) {
+                return Err(format!("argument `{k}` must be one of {}", p["enum"]));
+            }
+        }
         if p["pattern"] == "^C-[0-9]{4}$" {
             let s = v.as_str().unwrap_or("");
             if !(s.len() == 6 && s.starts_with("C-") && s[2..].chars().all(|c| c.is_ascii_digit()))
@@ -81,6 +113,25 @@ pub fn validate(schema: &Value, args: &Value) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Amount "12500.00" -> cents. None for negatives, junk or more than 2 decimals.
+fn cents(s: &str) -> Option<i64> {
+    let (w, f) = s.split_once('.').unwrap_or((s, "0"));
+    if w.is_empty() || w.len() > 12 || f.len() > 2 || !w.chars().chain(f.chars()).all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let f: i64 = format!("{f:0<2}").parse().ok()?;
+    Some(w.parse::<i64>().ok()? * 100 + f)
+}
+
+fn confirm_token(a: &Value, now: u64) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(format!("{a}|{now}").as_bytes())
+        .iter()
+        .take(8)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn err(id: &Value, code: i64, msg: &str) -> Value {
@@ -106,26 +157,16 @@ impl Server {
                 true,
             );
         }
-        let soap_call = |op: &str, id: &str| -> Value {
-            let req = match soap::envelope(op, "urn:acme:crm:v1", &json!({"CustomerId": id})) {
-                Ok(r) => r,
-                Err(e) => return tool_result(e, json!({}), true),
-            };
-            match soap::parse_response(&legacy::call(&req)) {
-                Ok(r) if r.get("fault").is_some() => {
-                    tool_result(format!("Legacy fault: {}", r["fault"]["message"]), r, true)
-                }
-                Ok(r) => tool_result(r["data"].to_string(), r["data"].clone(), false),
-                Err(e) => tool_result(format!("Bad SOAP response: {e}"), json!({}), true),
-            }
-        };
         match name {
-            "legacy_get_customer" => {
-                soap_call("GetCustomer", args["customer_id"].as_str().unwrap_or(""))
+            "legacy_get_customer" | "legacy_list_orders" => {
+                let op = if name == "legacy_get_customer" { "GetCustomer" } else { "ListOrders" };
+                let id = args["customer_id"].as_str().unwrap_or("");
+                match self.soap(op, json!({"CustomerId": id})) {
+                    Ok(d) => tool_result(d.to_string(), d, false),
+                    Err((m, d)) => tool_result(m, d, true),
+                }
             }
-            "legacy_list_orders" => {
-                soap_call("ListOrders", args["customer_id"].as_str().unwrap_or(""))
-            }
+            "legacy_update_customer" => self.update_customer(args),
             "sap_build_query" => {
                 let mut a = args.clone();
                 a["service_url"] =
@@ -137,6 +178,107 @@ impl Server {
             }
             _ => tool_result(format!("unknown tool {name}"), json!({}), true),
         }
+    }
+
+    /// One SOAP round trip to the backend. Ok(data) or Err((message, structured)).
+    fn soap(&mut self, op: &str, params: Value) -> Result<Value, (String, Value)> {
+        let req = soap::envelope(op, "urn:acme:crm:v1", &params).map_err(|e| (e, json!({})))?;
+        match soap::parse_response(&self.backend.call(&req)) {
+            Ok(r) if r.get("fault").is_some() => {
+                Err((format!("Legacy fault: {}", r["fault"]["message"]), r))
+            }
+            Ok(r) => Ok(r["data"].clone()),
+            Err(e) => Err((format!("Bad SOAP response: {e}"), json!({}))),
+        }
+    }
+
+    /// Safe write: validate, preview with a one-use token, commit once per idempotency key.
+    fn update_customer(&mut self, a: &Value) -> Value {
+        let id = a["customer_id"].as_str().unwrap_or("");
+        let field = a["field"].as_str().unwrap_or("");
+        let value = a["value"].as_str().unwrap_or("");
+        let want = a["expected_version"].as_u64().unwrap_or(0);
+        let fail = |m: String, d: Value| tool_result(m, d, true);
+        if a["mode"] == "commit" {
+            let key = a["idempotency_key"].as_str().unwrap_or("");
+            if key.is_empty() {
+                return fail("commit needs an idempotency_key".into(), json!({}));
+            }
+            if let Some((prev_args, prev)) = self.committed.get(key) {
+                let same = ["customer_id", "field", "value", "expected_version"]
+                    .iter()
+                    .all(|k| prev_args[*k] == a[*k]);
+                if !same {
+                    return fail(format!("idempotency_key {key} was already used for a different change"), json!({}));
+                }
+                let mut r = prev.clone();
+                r["structuredContent"]["replayed"] = json!(true);
+                r["content"][0]["text"] = json!(format!("Replayed earlier commit for key {key}; nothing written"));
+                return r;
+            }
+            let tok = a["confirm_token"].as_str().unwrap_or("");
+            let Some((previewed, exp)) = self.pending.remove(tok) else {
+                return fail("commit needs the confirm_token from a preview (tokens are one-use)".into(), json!({}));
+            };
+            let same = ["customer_id", "field", "value", "expected_version"]
+                .iter()
+                .all(|k| previewed[*k] == a[*k]);
+            if !same {
+                return fail("arguments differ from the preview; preview again".into(), json!({}));
+            }
+            if self.clock_ms > exp {
+                return fail("confirm_token expired; preview again".into(), json!({}));
+            }
+            // Write the normalized amount ("25000.5" -> "25000.50").
+            let value = match (field, cents(value)) {
+                ("CreditLimit", Some(c)) => format!("{}.{:02}", c / 100, c % 100),
+                _ => value.to_string(),
+            };
+            self.pending.retain(|_, (_, exp)| *exp >= self.clock_ms);
+            let r = match self.soap("UpdateCustomer", json!({"CustomerId": id, "Field": field,
+                "Value": value, "ExpectedVersion": want.to_string()}))
+            {
+                Ok(d) => tool_result(format!("Updated {id}.{field}"),
+                    json!({"committed": true, "record": d["Customer"]}), false),
+                Err((m, d)) => fail(m, d),
+            };
+            if r["isError"] == false {
+                self.committed.insert(key.to_string(), (a.clone(), r.clone()));
+            }
+            return r;
+        }
+        // preview
+        let cur = match self.soap("GetCustomer", json!({"CustomerId": id})) {
+            Ok(d) => d["Customer"].clone(),
+            Err((m, d)) => return fail(m, d),
+        };
+        let ver: u64 = cur["Version"].as_str().and_then(|v| v.parse().ok()).unwrap_or(0);
+        if ver != want {
+            return fail(format!("Conflict: record is at version {ver}, not {want}; re-read it"),
+                json!({"conflict": true, "current": cur}));
+        }
+        let before = cur[field].as_str().unwrap_or("").to_string();
+        match field {
+            "Status" if !["ACTIVE", "CREDIT_HOLD"].contains(&value) => {
+                return fail("Status must be ACTIVE or CREDIT_HOLD".into(), json!({}));
+            }
+            "CreditLimit" => {
+                let (Some(old), Some(new)) = (cents(&before), cents(value)) else {
+                    return fail("CreditLimit must be a non-negative amount like 25000.00".into(), json!({}));
+                };
+                let step = (new - old).abs();
+                if step > MAX_LIMIT_STEP_CENTS || (old > 0 && step * 100 > old * MAX_LIMIT_STEP_PCT) {
+                    return fail(format!("Change of {:.2} is over the agent limit; route to a human approver", step as f64 / 100.0),
+                        json!({"approval_required": true, "before": before, "after": value}));
+                }
+            }
+            _ => {}
+        }
+        let token = confirm_token(a, self.clock_ms);
+        self.pending.insert(token.clone(), (a.clone(), self.clock_ms + CONFIRM_TTL_MS));
+        tool_result(format!("Preview: {id}.{field} {before} -> {value}. Commit with confirm_token."),
+            json!({"preview": true, "diff": {"field": field, "before": before, "after": value},
+                   "version": ver, "confirm_token": token, "expires_at_ms": self.clock_ms + CONFIRM_TTL_MS}), false)
     }
 
     fn one(&mut self, m: &Value) -> Option<Value> {
@@ -334,5 +476,98 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn upd(s: &mut Server, args: Value) -> Value {
+        let m = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "legacy_update_customer", "arguments": args}});
+        let r: Value = serde_json::from_str(&s.handle(&m.to_string()).unwrap()).unwrap();
+        r["result"].clone()
+    }
+    fn base(mode: &str) -> Value {
+        json!({"customer_id": "C-1001", "field": "CreditLimit", "value": "25000.00", "expected_version": 7, "mode": mode})
+    }
+
+    #[test]
+    fn write_needs_preview_then_commits_once() {
+        let mut s = Server::default();
+        init(&mut s);
+        let mut c = base("commit");
+        c["idempotency_key"] = json!("k1");
+        c["confirm_token"] = json!("forged");
+        assert_eq!(upd(&mut s, c.clone())["isError"], true);
+        let p = upd(&mut s, base("preview"));
+        assert_eq!(p["isError"], false);
+        assert_eq!(p["structuredContent"]["diff"]["before"], "20000.00");
+        c["confirm_token"] = p["structuredContent"]["confirm_token"].clone();
+        let r = upd(&mut s, c.clone());
+        assert_eq!(r["structuredContent"]["record"]["CreditLimit"], "25000.00");
+        assert_eq!(r["structuredContent"]["record"]["Version"], "8");
+        // Retry with the same key (after the rate-limit window): same result, no second write.
+        s.clock_ms += 2_000;
+        let again = upd(&mut s, c);
+        assert_eq!(again["structuredContent"]["replayed"], true);
+        assert_eq!(s.backend.customers[0].version, 8);
+    }
+
+    #[test]
+    fn stale_version_and_big_jumps_and_changed_args_refused() {
+        let mut s = Server::default();
+        init(&mut s);
+        let mut stale = base("preview");
+        stale["expected_version"] = json!(6);
+        assert_eq!(upd(&mut s, stale)["structuredContent"]["conflict"], true);
+        let mut big = base("preview");
+        big["value"] = json!("90000.00");
+        assert_eq!(upd(&mut s, big)["structuredContent"]["approval_required"], true);
+        s.clock_ms += 3_000;
+        let p = upd(&mut s, base("preview"));
+        let mut c = base("commit");
+        c["value"] = json!("29000.00");
+        c["idempotency_key"] = json!("k2");
+        c["confirm_token"] = p["structuredContent"]["confirm_token"].clone();
+        assert_eq!(upd(&mut s, c)["isError"], true);
+        assert_eq!(s.backend.customers[0].credit_limit, "20000.00");
+    }
+
+    #[test]
+    fn expired_token_and_bad_enum_refused() {
+        let mut s = Server::default();
+        init(&mut s);
+        let p = upd(&mut s, base("preview"));
+        s.clock_ms += CONFIRM_TTL_MS + 1;
+        let mut c = base("commit");
+        c["idempotency_key"] = json!("k3");
+        c["confirm_token"] = p["structuredContent"]["confirm_token"].clone();
+        assert!(upd(&mut s, c)["content"][0]["text"].as_str().unwrap().contains("expired"));
+        let m = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {"name": "legacy_update_customer",
+            "arguments": {"customer_id": "C-1001", "field": "Balance", "value": "0", "expected_version": 7, "mode": "preview"}}});
+        assert!(s.handle(&m.to_string()).unwrap().contains("-32602"));
+    }
+
+    #[test]
+    fn cents_parser() {
+        assert_eq!(cents("25000.5"), Some(2_500_050));
+        assert_eq!(cents("-1.00"), None);
+        assert_eq!(cents("1.234"), None);
+        assert_eq!(cents("abc"), None);
+    }
+
+    #[test]
+    fn reused_key_with_other_change_refused_and_amount_normalized() {
+        let mut s = Server::default();
+        init(&mut s);
+        let mut b = base("preview");
+        b["value"] = json!("25000.5");
+        let p = upd(&mut s, b.clone());
+        let mut c = b.clone();
+        c["mode"] = json!("commit");
+        c["idempotency_key"] = json!("k9");
+        c["confirm_token"] = p["structuredContent"]["confirm_token"].clone();
+        assert_eq!(upd(&mut s, c.clone())["isError"], false);
+        assert_eq!(s.backend.customers[0].credit_limit, "25000.50");
+        s.clock_ms += 2_000;
+        let mut other = c;
+        other["customer_id"] = json!("C-1002");
+        assert_eq!(upd(&mut s, other)["isError"], true);
     }
 }
